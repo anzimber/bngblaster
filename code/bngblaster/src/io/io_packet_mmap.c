@@ -438,10 +438,18 @@ align_power_of_two_pages(uint32_t len)
 uint32_t
 io_packet_mmap_frame_size()
 {
+    static bool logged = false;
+    uint32_t page_size = getpagesize();
     uint32_t overhead = BBL_MAX_STREAM_OVERHEAD + (TPACKET2_HDRLEN - sizeof(struct sockaddr_ll));
     uint32_t min_frame_size = g_ctx->config.io_max_stream_len + overhead;
+    uint32_t frame_size = align_power_of_two_pages(min_frame_size);
 
-    return align_power_of_two_pages(min_frame_size);
+    if(!logged && frame_size > page_size) {
+        LOG(INFO, "packet_mmap jumbo frame support enabled: using %u byte ring frames for max stream length %u (higher memory usage, possible performance impact)\n",
+            frame_size, g_ctx->config.io_max_stream_len);
+        logged = true;
+    }
+    return frame_size;
 }
 
 void
