@@ -34,6 +34,44 @@ poll_kernel(io_handle_s *io, short events)
     }
 }
 
+static uint32_t
+io_packet_mmap_payload_size(io_handle_s *io)
+{
+    return io->req.tp_frame_size - (TPACKET2_HDRLEN - sizeof(struct sockaddr_ll));
+}
+
+static bool
+io_packet_mmap_tx_slot_available(io_handle_s *io, struct tpacket2_hdr *tphdr)
+{
+    if(tphdr->tp_status == TP_STATUS_AVAILABLE) {
+        return true;
+    }
+    if(tphdr->tp_status & TP_STATUS_WRONG_FORMAT) {
+        if(io->stats.to_long == 0) {
+            LOG(ERROR, "PACKET_MMAP TX frame rejected on interface %s (wrong format/oversized packet, check MTU and stream length)\n",
+                io->interface->name);
+        }
+        io->stats.to_long++;
+        tphdr->tp_status = TP_STATUS_AVAILABLE;
+        return true;
+    }
+    return false;
+}
+
+static bool
+io_packet_mmap_tx_len_valid(io_handle_s *io, uint16_t len, const char *name)
+{
+    uint32_t payload_size = io_packet_mmap_payload_size(io);
+
+    if(len <= payload_size) {
+        return true;
+    }
+    LOG(ERROR, "PACKET_MMAP packet on interface %s exceeds frame payload (%s, %u > %u)\n",
+        io->interface->name, name ? name : "control", len, payload_size);
+    io->stats.to_long++;
+    return false;
+}
+
 /**
  * This job is for PACKET_MMAP RX in main thread!
  */
@@ -150,7 +188,7 @@ io_packet_mmap_tx_job(timer_s *timer)
 
     frame_ptr = io->ring + (io->cursor * io->req.tp_frame_size);
     tphdr = (struct tpacket2_hdr*)frame_ptr;
-    if(tphdr->tp_status != TP_STATUS_AVAILABLE) {
+    if(!io_packet_mmap_tx_slot_available(io, tphdr)) {
         /* If no buffer is available poll kernel */
         poll_kernel(io, POLLOUT);
         io->stats.no_buffer++;
@@ -162,7 +200,7 @@ io_packet_mmap_tx_job(timer_s *timer)
         now = timespec_to_nsec(timer->timestamp);
         while(burst) {
             /* Check if this slot available for writing. */
-            if(tphdr->tp_status != TP_STATUS_AVAILABLE) {
+            if(!io_packet_mmap_tx_slot_available(io, tphdr)) {
                 io->stats.no_buffer++;
                 break;
             }
@@ -174,6 +212,9 @@ io_packet_mmap_tx_job(timer_s *timer)
                     ctrl = false;
                     continue;
                 }
+                if(!io_packet_mmap_tx_len_valid(io, io->buf_len, "control")) {
+                    continue;
+                }
             } else {
                 if(!(g_traffic && g_init_phase == false && interface->state == INTERFACE_UP)) {
                     bbl_stream_io_stop(io);
@@ -181,6 +222,10 @@ io_packet_mmap_tx_job(timer_s *timer)
                 }
                 stream = bbl_stream_io_send_iter(io, now);
                 if(unlikely(stream == NULL)) {
+                    break;
+                }
+                if(!io_packet_mmap_tx_len_valid(io, stream->tx_len, stream->config->name)) {
+                    stream->enabled = false;
                     break;
                 }
                 memcpy(io->buf, stream->tx_buf, stream->tx_len);
@@ -216,8 +261,10 @@ io_packet_mmap_tx_job(timer_s *timer)
     if(io->queued) {
         /* Notify kernel. */
         if(sendto(io->fd, NULL, 0, 0, NULL, 0) < 0) {
-            LOG(IO, "PACKET_MMAP sendto on interface %s failed with error %s (%d)\n", 
-                interface->name, strerror(errno), errno);
+            LOG(errno == EMSGSIZE ? ERROR : IO,
+                "PACKET_MMAP sendto on interface %s failed with error %s (%d)%s\n",
+                interface->name, strerror(errno), errno,
+                errno == EMSGSIZE ? ", check MTU and stream length" : "");
             io->stats.io_errors++;
         } else {
             io->queued = 0;
@@ -318,7 +365,7 @@ io_packet_mmap_thread_tx_run_fn(io_thread_s *thread)
 
         frame_ptr = io->ring + (io->cursor * io->req.tp_frame_size);
         tphdr = (struct tpacket2_hdr *)frame_ptr;
-        if(tphdr->tp_status != TP_STATUS_AVAILABLE) {
+        if(!io_packet_mmap_tx_slot_available(io, tphdr)) {
             /* If no buffer is available poll kernel. */
             io->stats.no_buffer++;
             poll_kernel(io, POLLOUT);
@@ -332,7 +379,7 @@ io_packet_mmap_thread_tx_run_fn(io_thread_s *thread)
         ctrl = true;
         now = timespec_to_nsec(&io->timestamp);
         while(burst) {
-            if(tphdr->tp_status != TP_STATUS_AVAILABLE) {
+            if(!io_packet_mmap_tx_slot_available(io, tphdr)) {
                 io->stats.no_buffer++;
                 poll_kernel(io, POLLOUT);
                 break;
@@ -344,6 +391,10 @@ io_packet_mmap_thread_tx_run_fn(io_thread_s *thread)
                 slot = bbl_txq_read_slot(txq);
                 if(slot) {
                     io->buf_len = slot->packet_len;
+                    if(!io_packet_mmap_tx_len_valid(io, io->buf_len, "control")) {
+                        bbl_txq_read_next(txq);
+                        continue;
+                    }
                     memcpy(io->buf, slot->packet, slot->packet_len);
                     bbl_txq_read_next(txq);
                 } else {
@@ -358,6 +409,10 @@ io_packet_mmap_thread_tx_run_fn(io_thread_s *thread)
                 /* Send traffic streams up to allowed burst. */
                 stream = bbl_stream_io_send_iter(io, now);
                 if(unlikely(stream == NULL)) {
+                    break;
+                }
+                if(!io_packet_mmap_tx_len_valid(io, stream->tx_len, stream->config->name)) {
+                    stream->enabled = false;
                     break;
                 }
                 memcpy(io->buf, stream->tx_buf, stream->tx_len);
@@ -383,8 +438,10 @@ io_packet_mmap_thread_tx_run_fn(io_thread_s *thread)
         if(io->queued) {
             /* Notify kernel. */
             if(sendto(io->fd, NULL, 0, 0, NULL, 0) < 0) {
-                LOG(IO, "PACKET_MMAP sendto on interface %s failed with error %s (%d)\n", 
-                    interface->name, strerror(errno), errno);
+                LOG(errno == EMSGSIZE ? ERROR : IO,
+                    "PACKET_MMAP sendto on interface %s failed with error %s (%d)%s\n",
+                    interface->name, strerror(errno), errno,
+                    errno == EMSGSIZE ? ", check MTU and stream length" : "");
                 io->stats.io_errors++;
             } else {
                 io->queued = 0;
@@ -424,15 +481,11 @@ io_packet_mmap_init(io_handle_s *io)
 }
 
 static uint32_t
-align_power_of_two_pages(uint32_t len)
+align_pages(uint32_t len)
 {
     uint32_t page_size = getpagesize();
-    uint32_t frame_size = page_size;
 
-    while(frame_size < len) {
-        frame_size <<= 1;
-    }
-    return frame_size;
+    return ((len + page_size - 1) / page_size) * page_size;
 }
 
 uint32_t
@@ -442,7 +495,7 @@ io_packet_mmap_frame_size()
     uint32_t page_size = getpagesize();
     uint32_t overhead = BBL_MAX_STREAM_OVERHEAD + (TPACKET2_HDRLEN - sizeof(struct sockaddr_ll));
     uint32_t min_frame_size = g_ctx->config.io_max_stream_len + overhead;
-    uint32_t frame_size = align_power_of_two_pages(min_frame_size);
+    uint32_t frame_size = align_pages(min_frame_size);
 
     if(!logged && frame_size > page_size) {
         LOG(INFO, "packet_mmap jumbo frame support enabled: using %u byte ring frames for max stream length %u (higher memory usage, possible performance impact)\n",
