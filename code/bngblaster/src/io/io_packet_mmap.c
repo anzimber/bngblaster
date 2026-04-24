@@ -423,10 +423,32 @@ io_packet_mmap_init(io_handle_s *io)
     return true;
 }
 
+static uint32_t
+align_power_of_two_pages(uint32_t len)
+{
+    uint32_t page_size = getpagesize();
+    uint32_t frame_size = page_size;
+
+    while(frame_size < len) {
+        frame_size <<= 1;
+    }
+    return frame_size;
+}
+
+uint32_t
+io_packet_mmap_frame_size()
+{
+    uint32_t overhead = BBL_MAX_STREAM_OVERHEAD + (TPACKET2_HDRLEN - sizeof(struct sockaddr_ll));
+    uint32_t min_frame_size = g_ctx->config.io_max_stream_len + overhead;
+
+    return align_power_of_two_pages(min_frame_size);
+}
+
 void
 io_packet_mmap_set_max_stream_len()
 {
-    uint16_t len = getpagesize() - BBL_MAX_STREAM_OVERHEAD - (TPACKET2_HDRLEN - sizeof(struct sockaddr_ll));
+    uint32_t frame_size = io_packet_mmap_frame_size();
+    uint16_t len = frame_size - BBL_MAX_STREAM_OVERHEAD - (TPACKET2_HDRLEN - sizeof(struct sockaddr_ll));
 
     if(len < g_ctx->config.io_max_stream_len) {
         LOG(DEBUG, "Set max allowed stream length to %u because of packet_mmap limitations\n", len);

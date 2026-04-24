@@ -78,7 +78,7 @@ set_ring(io_handle_s *io, int slots)
     } else {
         flag = PACKET_TX_RING;
     }
-    io->req.tp_block_size = getpagesize(); /* 4096 */
+    io->req.tp_block_size = io_packet_mmap_frame_size();
     io->req.tp_frame_size = io->req.tp_block_size;
     io->req.tp_block_nr = slots;
     io->req.tp_frame_nr = slots;
